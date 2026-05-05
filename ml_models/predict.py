@@ -1,18 +1,34 @@
 """
-Standard Library Imports
+ml_models/predict.py — Main prediction orchestrator.
+
+This module is the single entry point for running disease risk inference.
+RiskPredictor.predict() ties together every part of the ML pipeline:
+
+  OCR metrics (dict)
+      ↓  validate_ocr_metrics()   — checks which features were found vs. missing
+      ↓  build_feature_vector()   — builds a numpy array, filling gaps with defaults
+      ↓  _load_all_models()       — loads all XGBoost .pkl files for the report type
+      ↓  _run_individual_models() — runs each XGBoost model → raw disease probabilities
+      ↓  _apply_ensemble()        — passes through NeuralEnsemble meta-learner
+      ↓  _compute_shap()          — explains the highest-risk disease with SHAP
+      ↓  _score_to_level()        — converts max probability to risk_level string
+      ↓  _recommendations()       — returns actionable advice based on risk_level
+      ↓
+  Full prediction dict
+
+Module-level caching:
+  _MODEL_CACHE stores loaded XGBoost objects by pkl_name.  Within a single Celery
+  worker process this means a model is read from disk only once — all subsequent
+  tasks reuse the in-memory object.  The cache is NOT shared across worker processes
+  (each process has its own memory space).
 """
+
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-"""
-Third party imports
-"""
 import joblib
 import numpy as np
 
-"""
-Internal Project imports
-"""
 from ml_models.model_utils import (
     REPORT_MODEL_MAP,
     RISK_THRESHOLDS,
@@ -22,25 +38,37 @@ from ml_models.model_utils import (
 from ml_models.neural_ensemble import load_ensemble
 from ml_models.xgboost.feature_engineering import build_feature_vector, validate_ocr_metrics
 
-"""
-Logger Set-up
-"""
 logger = logging.getLogger(__name__)
 
-"""
-Individual disease model cache
-Keys: pkl_filename (e.g. "diabetes", "heart")
-"""
+# Process-level model cache: {pkl_name: loaded_model_object}
+# Example: {"diabetes": <XGBClassifier>, "anemia": <XGBClassifier>, ...}
+# Populated lazily on first predict() call; reused for all subsequent calls.
 _MODEL_CACHE: Dict[str, Any] = {}
 
 
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
+# ── Model loading ─────────────────────────────────────────────────────────────
 
 def _load_disease_model(pkl_name: str) -> Any:
     """
-    Loads and caches a single disease XGBoost model by its pkl filename.
+    Load and cache a single XGBoost disease model from its .pkl file.
+
+    On first call the model is read from disk with joblib.load() and stored in
+    _MODEL_CACHE.  On subsequent calls the cached object is returned immediately
+    without touching the filesystem.  This is important because PaddleOCR +
+    XGBoost together use significant RAM; avoiding repeated disk reads keeps
+    task throughput consistent.
+
+    Args:
+        pkl_name — short name used as the cache key and for path resolution,
+                   e.g. "diabetes" resolves to ml_models/xgboost/diabetes.pkl.
+
+    Returns:
+        The loaded model object (XGBClassifier or any sklearn-compatible model).
+
+    Raises:
+        FileNotFoundError — if get_disease_model_path() cannot find the .pkl.
+                            The caller (_load_all_models) catches this and inserts
+                            a None placeholder so prediction continues with 0.0.
     """
     if pkl_name in _MODEL_CACHE:
         return _MODEL_CACHE[pkl_name]
@@ -54,12 +82,28 @@ def _load_disease_model(pkl_name: str) -> Any:
 
 def _load_all_models(report_type: str) -> List[Tuple[str, str, Any]]:
     """
-    Loads every disease model for the given report type.
+    Load every disease model registered for the given report type.
 
-    Returns
-    -------
-    List of (disease_label, pkl_name, model) tuples,
-    in the order defined by REPORT_MODEL_MAP.
+    Iterates over REPORT_MODEL_MAP[report_type] and calls _load_disease_model()
+    for each entry.  If a model file is missing (FileNotFoundError), a None
+    placeholder is inserted instead of crashing — the downstream code checks for
+    None and uses a 0.0 probability for that disease.
+
+    Why allow missing models?
+      During development not all 14 models may be trained yet.  The system should
+      still return predictions for the models that DO exist rather than failing
+      entirely.  Missing models log an error for visibility.
+
+    Args:
+        report_type — must be a key in REPORT_MODEL_MAP (blood, lipid, etc.).
+
+    Returns:
+        List of (disease_label, pkl_name, model_or_None) tuples in the order
+        defined by REPORT_MODEL_MAP.  ORDER MATTERS — it determines the index
+        positions passed to the NeuralEnsemble.
+
+    Raises:
+        ValueError — if report_type is not in REPORT_MODEL_MAP.
     """
     entries = REPORT_MODEL_MAP.get(report_type, [])
     if not entries:
@@ -72,38 +116,49 @@ def _load_all_models(report_type: str) -> List[Tuple[str, str, Any]]:
             loaded.append((disease_label, pkl_name, model))
         except FileNotFoundError as exc:
             logger.error(exc)
-            # Insert None placeholder so indices stay aligned
+            # None placeholder keeps indices aligned for the ensemble input vector.
             loaded.append((disease_label, pkl_name, None))
 
     return loaded
 
 
-# ---------------------------------------------------------------------------
-# Inference helpers
-# ---------------------------------------------------------------------------
+# ── Inference helpers ─────────────────────────────────────────────────────────
 
 def _disease_probability(model: Any, X: np.ndarray) -> Tuple[float, int]:
     """
-    Extracts the disease risk probability from a multi-class XGBoost model.
+    Extract a single disease risk probability from a multi-class XGBoost model.
 
-    All 14 models use severity-level encoding:
-        Class 0 = healthy / no disease
-        Class 1 = mild disease
-        Class 2 = moderate disease
-        Class 3 = severe disease  (4-class models only)
+    All 14 disease models use severity-level class encoding:
+        Class 0 — healthy / no disease
+        Class 1 — mild disease
+        Class 2 — moderate disease
+        Class 3 — severe disease  (only in 4-class models)
 
-    Disease risk  = 1 - P(class 0)
-    This gives the probability that the patient has ANY level of the disease,
-    regardless of severity.  It is always in [0, 1] and correctly handles
-    both 3-class and 4-class models.
+    "Disease risk" is defined as:
+        risk = 1 - P(class 0) = P(any disease)
 
-    Also returns the predicted severity class for logging.
+    This formulation correctly handles both 3-class and 4-class models because
+    it only looks at P(healthy) and inverts it.  It gives the probability that
+    the patient has the disease at ANY severity level.
+
+    The "severity_class" is the argmax of the full probability vector — the
+    most likely single class.  It is logged for debugging and passed to SHAP
+    so explanations are computed for the predicted class, not always class 1.
+
+    Args:
+        model — loaded XGBClassifier with predict_proba() support.
+        X     — numpy array of shape (1, n_features) — single patient's features.
+
+    Returns:
+        (disease_risk, severity_class)
+          disease_risk   — float in [0, 1]
+          severity_class — int: 0=none, 1=mild, 2=moderate, 3=severe
     """
-    all_probas = model.predict_proba(X)[0]          # shape: (n_classes,)
-    p_healthy  = float(all_probas[0])               # P(no disease)
+    all_probas = model.predict_proba(X)[0]       # shape: (n_classes,)
+    p_healthy  = float(all_probas[0])            # P(class 0 = no disease)
     disease_risk = round(1.0 - p_healthy, 6)
 
-    # Severity class: index of the highest non-zero class probability
+    # argmax gives the most probable single class — used for SHAP explanation.
     severity_class = int(np.argmax(all_probas))
 
     return disease_risk, severity_class
@@ -114,22 +169,34 @@ def _run_individual_models(
     X: np.ndarray,
 ) -> Tuple[List[str], np.ndarray, List[int]]:
     """
-    Runs every individual disease model on the feature vector X.
+    Run every individual disease model on the shared feature vector X.
 
-    Returns
-    -------
-    disease_labels   : list of str
-    raw_probas       : 1-D array — disease risk score per model (1 - P(class 0))
-    severity_classes : predicted severity class per model (0=none,1=mild,2=mod,3=severe)
+    Iterates over all (disease_label, pkl_name, model) tuples for the report
+    type.  For each model:
+      - If model is None (missing .pkl): appends 0.0 risk and severity 0.
+      - If model has predict_proba(): uses _disease_probability() to get 1-P(class0).
+      - If model only has predict() (unusual): treats the output as a binary score.
+      - On inference exception: logs a warning and uses 0.0 so the pipeline
+        continues for the remaining models.
+
+    Args:
+        loaded_models — list from _load_all_models(), tuples of (label, name, model).
+        X             — numpy array shape (1, n_features).
+
+    Returns:
+        disease_labels   — list of str, same order as loaded_models.
+        raw_probas       — 1-D float32 array, one probability per disease.
+        severity_classes — list of int, predicted severity class per disease.
     """
-    disease_labels: List[str]  = []
-    raw_probas:     List[float] = []
-    severity_classes: List[int] = []
+    disease_labels:   List[str]   = []
+    raw_probas:       List[float] = []
+    severity_classes: List[int]   = []
 
     for disease_label, pkl_name, model in loaded_models:
         disease_labels.append(disease_label)
 
         if model is None:
+            # Missing model — use zero so this disease doesn't influence risk_level.
             raw_probas.append(0.0)
             severity_classes.append(0)
             continue
@@ -138,6 +205,7 @@ def _run_individual_models(
             if hasattr(model, "predict_proba"):
                 proba, sev = _disease_probability(model, X)
             else:
+                # Legacy binary regressor path (shouldn't occur with current models).
                 proba = float(model.predict(X)[0])
                 sev   = 1 if proba >= 0.5 else 0
         except Exception as exc:
@@ -156,21 +224,32 @@ def _apply_ensemble(
     raw_probas: np.ndarray,
 ) -> np.ndarray:
     """
-    Passes raw XGBoost probabilities through the neural network ensemble
-    meta-learner for the given report type.
+    Pass raw XGBoost probabilities through the NeuralEnsemble meta-learner.
 
-    If no trained weights exist the ensemble is a transparent pass-through
-    (returns raw_probas unchanged).
+    The ensemble is a small 3-layer MLP trained to calibrate the raw XGBoost
+    outputs — it learns systematic biases across diseases for the same report
+    type (e.g. if the blood models tend to over-predict diabetes, the ensemble
+    corrects for that).
+
+    If no trained ensemble weights exist (ensemble_{report_type}.pkl not found),
+    load_ensemble() returns an untrained NeuralEnsemble whose predict() method
+    is an identity pass-through — the raw probabilities are returned unchanged.
+    This means the system works correctly even before the ensemble is trained.
+
+    Args:
+        report_type — used to find the correct ensemble .pkl file.
+        raw_probas  — 1-D array of shape (n_diseases,) from _run_individual_models.
+
+    Returns:
+        np.ndarray of shape (n_diseases,) — calibrated probabilities.
     """
     ensemble_path = get_ensemble_path(report_type)
-    n_diseases = len(raw_probas)
-    ensemble = load_ensemble(report_type, ensemble_path, n_diseases)
+    n_diseases    = len(raw_probas)
+    ensemble      = load_ensemble(report_type, ensemble_path, n_diseases)
     return ensemble.predict(raw_probas)
 
 
-# ---------------------------------------------------------------------------
-# SHAP & recommendations
-# ---------------------------------------------------------------------------
+# ── SHAP & recommendations ────────────────────────────────────────────────────
 
 def _compute_shap(
     model: Any,
@@ -179,26 +258,45 @@ def _compute_shap(
     severity_class: int = 1,
 ) -> Optional[Dict]:
     """
-    Computes SHAP feature importance for a multi-class XGBoost model.
+    Compute SHAP feature importance for a single XGBoost model prediction.
 
-    For multi-class models, shap_values() returns a list — one array per class.
-    We explain the predicted severity class (passed as `severity_class`).
-    If it is 0 (healthy), we fall back to class 1 (mild disease) so the
-    explanation always shows what features influence the disease direction.
+    SHAP (SHapley Additive exPlanations) assigns each feature a "contribution
+    score" for the predicted output.  A positive SHAP value means the feature
+    pushed the model toward a higher disease risk; negative means it reduced risk.
+
+    For multi-class XGBoost, shap.TreeExplainer returns one SHAP array per class:
+      sv = [array_class0, array_class1, array_class2, ...]
+    We explain the severity_class that the model predicted.  If the model predicted
+    class 0 (healthy), we fall back to class 1 (mild) so the explanation always
+    shows disease-relevant drivers rather than "why is the patient healthy."
+
+    This function is called ONLY on the highest-risk disease model so the SHAP
+    values shown to the user are relevant to their biggest concern.
+
+    Args:
+        model          — trained XGBClassifier.
+        X              — numpy array shape (1, n_features).
+        feature_names  — list of feature name strings matching X's columns.
+        severity_class — predicted class from _disease_probability(), used to
+                         select which class to explain.
+
+    Returns:
+        Dict mapping feature name → SHAP value (float), or None if SHAP fails.
+        None is handled gracefully by _top_factors() which returns [].
     """
     try:
         import shap
         explainer = shap.TreeExplainer(model)
-        sv = explainer.shap_values(X)   # list of (1, n_feat) arrays, one per class
+        sv = explainer.shap_values(X)   # list[(1, n_feat)] or (1, n_feat) for binary
 
         if isinstance(sv, list):
-            # Multi-class: pick the disease class to explain
+            # Multi-class: pick the class to explain.
             explain_class = severity_class if severity_class > 0 else 1
-            # Guard against models with fewer classes than expected
+            # Guard: clamp to valid class index in case model has fewer classes.
             explain_class = min(explain_class, len(sv) - 1)
             values = sv[explain_class][0]
         else:
-            # Binary (shouldn't occur but handle gracefully)
+            # Binary model (unusual but handled).
             values = sv[0]
 
         return {name: round(float(v), 6) for name, v in zip(feature_names, values)}
@@ -212,6 +310,27 @@ def _top_factors(
     feature_names: List[str],
     n: int = 5,
 ) -> List[Dict]:
+    """
+    Return the top N features by absolute SHAP magnitude.
+
+    These become the "key_factors" displayed in the Results section of the UI
+    under "What's driving your risk?"
+
+    Factors are sorted by |SHAP value| descending so the most influential feature
+    appears first regardless of direction (a large negative SHAP that strongly
+    reduces risk is equally notable as a large positive one).
+
+    Args:
+        shap_values   — dict from _compute_shap(), or None.
+        feature_names — ordered list of feature names (not used here since
+                        shap_values keys already contain names; kept for signature
+                        consistency with earlier versions).
+        n             — number of top factors to return (default 5).
+
+    Returns:
+        List of dicts: [{"feature": str, "impact": float, "direction": str}, ...]
+        Returns [] if shap_values is None.
+    """
     if not shap_values:
         return []
     top = sorted(shap_values.items(), key=lambda kv: abs(kv[1]), reverse=True)[:n]
@@ -226,6 +345,25 @@ def _top_factors(
 
 
 def _score_to_level(score: float) -> str:
+    """
+    Convert a max disease risk probability (0–1) to a risk level string.
+
+    Thresholds are defined in RISK_THRESHOLDS (model_utils.py) and are applied
+    to the MAXIMUM risk across all diseases for the report type.  Using the max
+    ensures the overall risk level reflects the single most concerning disease.
+
+    Threshold logic (waterfall — first match wins):
+      score ≥ 0.85 → "critical"   seek immediate medical attention
+      score ≥ 0.65 → "high"       schedule a doctor visit soon
+      score ≥ 0.40 → "moderate"   follow up within 3 months
+      otherwise    → "low"        maintain current lifestyle
+
+    Args:
+        score — float in [0, 1], the highest disease probability after ensemble.
+
+    Returns:
+        One of: "critical", "high", "moderate", "low".
+    """
     if score >= RISK_THRESHOLDS["critical"]:  return "critical"
     if score >= RISK_THRESHOLDS["high"]:      return "high"
     if score >= RISK_THRESHOLDS["moderate"]:  return "moderate"
@@ -233,6 +371,27 @@ def _score_to_level(score: float) -> str:
 
 
 def _recommendations(risk_level: str, risks: Dict[str, float]) -> List[str]:
+    """
+    Build a list of actionable health recommendations.
+
+    Combines two sources:
+      1. Base recommendations keyed by risk_level — general advice for everyone
+         at that level (e.g. "Consult your doctor within 3 months" for moderate).
+      2. Disease-specific recommendations — appended when a specific disease
+         probability exceeds 0.60, giving targeted advice for the patient's
+         particular pattern (e.g. cardiovascular diet if heart_disease > 0.6).
+
+    The 0.60 threshold for disease-specific messages is deliberately lower than
+    the "high" risk threshold (0.65) so the message appears while there is still
+    time to act rather than only after the risk is already rated "high".
+
+    Args:
+        risk_level — string from _score_to_level().
+        risks      — {disease: float} dict of calibrated probabilities.
+
+    Returns:
+        List of recommendation strings, base first then disease-specific.
+    """
     base = {
         "low":      ["Maintain current lifestyle. Annual check-up recommended."],
         "moderate": [
@@ -254,6 +413,7 @@ def _recommendations(risk_level: str, risks: Dict[str, float]) -> List[str]:
 
     recs = list(base.get(risk_level, base["unknown"]))
 
+    # Append disease-specific advice when the individual disease risk is notable.
     if risks.get("heart_disease", 0) > 0.6:
         recs.append("High cardiovascular risk — lipid management advised.")
     if risks.get("diabetes", 0) > 0.6:
@@ -268,47 +428,73 @@ def _recommendations(risk_level: str, risks: Dict[str, float]) -> List[str]:
     return recs
 
 
-# ---------------------------------------------------------------------------
-# Main prediction class
-# ---------------------------------------------------------------------------
+# ── Main prediction class ─────────────────────────────────────────────────────
 
 class RiskPredictor:
     """
-    High-level wrapper for disease risk prediction.
+    High-level orchestrator for the full disease risk prediction pipeline.
 
-    For each report type the predictor:
-      1. Loads every individual disease model (e.g. diabetes.pkl, anemia.pkl,
-         infection.pkl for a blood report).
-      2. Builds a shared feature vector from the extracted lab metrics.
-      3. Runs each XGBoost binary classifier independently.
-      4. Passes all raw probabilities through the Neural Network ensemble
-         meta-learner (ensemble_{report_type}.pkl) for calibration.
-      5. Computes SHAP explanations from the highest-risk disease model.
-      6. Returns aggregated risks, risk_level, key_factors, recommendations.
+    Instantiated once per Celery task call (but models are cached globally in
+    _MODEL_CACHE so the cost is just the object allocation).
+
+    For each predict() call:
+      1. Load all XGBoost disease models for the report type.
+      2. Validate OCR metric coverage and build the feature vector.
+      3. Run each model independently → raw probabilities (1 - P(class 0)).
+      4. Pass raw probabilities through the NeuralEnsemble meta-learner.
+      5. Compute SHAP values on the highest-risk disease model.
+      6. Return the full prediction dict.
     """
 
     def __init__(self):
-        pass  # models are cached globally
+        # Models are loaded lazily per-call and cached in _MODEL_CACHE at module level.
+        pass
 
     def predict(
         self,
         metrics: Dict[str, Any],
         report_type: str = "blood",
     ) -> Dict[str, Any]:
+        """
+        Run the full disease risk prediction pipeline on extracted lab metrics.
 
-        # ── 1. Load all disease models for this report type ──────────────
+        Args:
+            metrics     — structured_metrics dict from OCR:
+                          {key: {"value": float, "unit": str, "source": str}}
+            report_type — selects which models and feature layout to use.
+                          Must be in REPORT_MODEL_MAP.
+
+        Returns a dict with:
+          risks           — {disease: float}  calibrated probability per disease.
+          risk_level      — "low" / "moderate" / "high" / "critical".
+          key_factors     — top 5 SHAP drivers for the highest-risk disease.
+          recommendations — actionable advice list.
+          shap_values     — full SHAP dict for the highest-risk disease, or None.
+          model_version   — "neural-ensemble-{report_type}-v1".
+          severity        — {disease: int}  predicted severity class per disease.
+          ocr_coverage    — {found, missing, coverage_pct} from validation.
+          raw_xgb_probas  — pre-ensemble XGBoost scores (for debugging).
+
+        Returns _fallback_response() if the report_type is unknown.
+        """
+
+        # ── 1. Load all disease models for this report type ───────────────
         try:
             loaded_models = _load_all_models(report_type)
         except ValueError as exc:
             logger.error(exc)
             return self._fallback_response()
 
-        # ── 2. Validate OCR metrics coverage, then build feature vector ──
+        # ── 2. Validate OCR coverage, then build the feature vector ───────
+        # validate_ocr_metrics logs which features were found/missing and
+        # returns an unchanged metrics dict + a coverage report.
+        # build_feature_vector normalises units and fills missing features
+        # with clinically sensible default values.
         metrics, coverage = validate_ocr_metrics(metrics, report_type)
         feature_vector, feature_names = build_feature_vector(metrics, report_type)
         X = np.array(feature_vector, dtype=np.float32).reshape(1, -1)
 
-        # ── 3. Run each individual disease model ─────────────────────────
+        # ── 3. Run each individual disease model ──────────────────────────
         disease_labels, raw_probas, severity_classes = _run_individual_models(loaded_models, X)
 
         logger.info(
@@ -319,7 +505,7 @@ class RiskPredictor:
             )
         )
 
-        # ── 4. Neural network ensemble: calibrate / combine ───────────────
+        # ── 4. Neural ensemble: calibrate combined probabilities ──────────
         final_probas = _apply_ensemble(report_type, raw_probas)
 
         logger.info(
@@ -329,16 +515,19 @@ class RiskPredictor:
             )
         )
 
-        # ── 5. Build output risks dict ────────────────────────────────────
+        # ── 5. Build the risks output dict ────────────────────────────────
         risks: Dict[str, float] = {
             label: round(float(p), 4)
             for label, p in zip(disease_labels, final_probas)
         }
 
-        max_risk = max(risks.values()) if risks else 0.0
+        # Overall risk level is determined by the single highest disease probability.
+        max_risk   = max(risks.values()) if risks else 0.0
         risk_level = _score_to_level(max_risk)
 
-        # ── 6. SHAP on the highest-risk disease model ─────────────────────
+        # ── 6. SHAP on the disease with the highest calibrated risk ───────
+        # Computing SHAP for every model would be expensive.  Only the disease
+        # the patient should be most concerned about needs an explanation.
         shap_values: Optional[Dict] = None
         if risks:
             top_disease = max(risks, key=risks.get)
@@ -359,15 +548,14 @@ class RiskPredictor:
             "recommendations": _recommendations(risk_level, risks),
             "shap_values":     shap_values,
             "model_version":   f"neural-ensemble-{report_type}-v1",
-            # Severity class per disease: 0=none, 1=mild, 2=moderate, 3=severe
+            # Per-disease severity class: 0=none, 1=mild, 2=moderate, 3=severe.
             "severity": {
                 label: sev
                 for label, sev in zip(disease_labels, severity_classes)
             },
-            # OCR quality metadata
-            "ocr_coverage":    coverage,
-            # Raw pre-ensemble scores for debugging / ensemble training
-            "raw_xgb_probas":  {
+            "ocr_coverage":   coverage,
+            # Pre-ensemble scores preserved for debugging and ensemble retraining.
+            "raw_xgb_probas": {
                 label: round(float(p), 4)
                 for label, p in zip(disease_labels, raw_probas)
             },
@@ -375,6 +563,13 @@ class RiskPredictor:
 
     @staticmethod
     def _fallback_response() -> Dict[str, Any]:
+        """
+        Return a safe empty-result dict when prediction cannot run.
+
+        Triggered when the report_type is not in REPORT_MODEL_MAP (e.g. a future
+        report type that hasn't been registered yet).  Returns risk_level="unknown"
+        so the frontend shows a neutral state rather than a misleading low/high risk.
+        """
         return {
             "risks":           {},
             "risk_level":      "unknown",
